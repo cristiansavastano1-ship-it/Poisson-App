@@ -531,10 +531,9 @@ with tab_backtest:
         st.info("📊 Backtest non disponibile per le competizioni europee: football-data.org "
                 "non fornisce quote di mercato, quindi non c'è nulla su cui calcolare valore o ROI.")
         st.stop()
+    st.caption("Versione semplificata: solo percentuale di vittoria (nessuna gestione della puntata).")
     soglia = st.slider("Soglia score", 0, 90, 50, 10)
     usa_oos = st.checkbox("Valida SOLO su stagione corrente (out-of-sample, consigliato)", value=True)
-    usa_kelly = st.checkbox("Usa Kelly frazionario (altrimenti stake fissa 1 unità)", value=True)
-    frazione_kelly = st.slider("Frazione Kelly", 0.05, 1.0, 0.25, 0.05, disabled=not usa_kelly)
 
     if st.button("📈 Esegui Backtest", type="primary"):
         with st.spinner("Backtest in corso..."):
@@ -555,7 +554,7 @@ with tab_backtest:
                 st.warning("⚠️ Nessuna partita di stagione corrente disponibile per la validazione "
                             "out-of-sample. Disattiva l'opzione per un test provvisorio in-sample.")
             else:
-                n_bet, n_win, stake_tot, ritorno_tot, bankroll = 0, 0, 0.0, 0.0, 100.0
+                n_bet, n_win = 0, 0
                 somma_clv, n_clv_pos, n_clv = 0.0, 0, 0
 
                 for i in indici:
@@ -575,51 +574,32 @@ with tab_backtest:
                     esito = '1' if partita['FTHG']>partita['FTAG'] else ('2' if partita['FTHG']<partita['FTAG'] else 'X')
 
                     opzioni_bet = [
-                        ('1', sc1, quote['q_casa_grezza'], m['prob_1']/100, quote_ch['q_casa_grezza'] if quote_ch else None),
-                        ('X', scx, quote['q_x_grezza'], m['prob_X']/100, quote_ch['q_x_grezza'] if quote_ch else None),
-                        ('2', sc2, quote['q_trasf_grezza'], m['prob_2']/100, quote_ch['q_trasf_grezza'] if quote_ch else None),
+                        ('1', sc1, quote_ch['q_casa_grezza'] if quote_ch else None),
+                        ('X', scx, quote_ch['q_x_grezza'] if quote_ch else None),
+                        ('2', sc2, quote_ch['q_trasf_grezza'] if quote_ch else None),
                     ]
-                    for segno, score, q_reale, p_mod, q_chiusura in opzioni_bet:
+                    quote_grezze = {'1': quote['q_casa_grezza'], 'X': quote['q_x_grezza'], '2': quote['q_trasf_grezza']}
+                    for segno, score, q_chiusura in opzioni_bet:
                         if score < soglia: continue
-                        stake = 1.0
-                        if usa_kelly:
-                            net = q_reale - 1.0
-                            if net <= 0: continue
-                            f_k = p_mod - (1-p_mod)/net
-                            if f_k <= 0: continue
-                            stake = min(bankroll, bankroll * f_k * frazione_kelly)
-                            if stake < 0.01: continue
                         n_bet += 1
-                        stake_tot += stake
                         if segno == esito:
                             n_win += 1
-                            vincita = stake * q_reale
-                            ritorno_tot += vincita
-                            bankroll += vincita - stake
-                        else:
-                            bankroll -= stake
                         if q_chiusura:
-                            clv_pct = (q_reale/q_chiusura - 1)*100
+                            clv_pct = (quote_grezze[segno]/q_chiusura - 1)*100
                             somma_clv += clv_pct
                             n_clv += 1
                             if clv_pct > 0: n_clv_pos += 1
-                        if usa_kelly and bankroll <= 0: break
 
                 if n_bet == 0:
                     st.warning(f"Nessuna scommessa avrebbe superato la soglia {soglia} sulle {len(indici)} partite valutate.")
                 else:
-                    profitto = ritorno_tot - stake_tot
-                    roi = (profitto/stake_tot)*100
                     win_rate = (n_win/n_bet)*100
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Scommesse", n_bet)
+                    c1, c2 = st.columns(2)
+                    c1.metric("Scommesse valutate", n_bet)
                     c2.metric("Win rate", f"{win_rate:.1f}%")
-                    c3.metric("ROI", f"{roi:+.1f}%")
-                    if usa_kelly:
-                        st.metric("Bankroll finale (da 100)", f"{bankroll:.2f}", f"{(bankroll/100-1)*100:+.1f}%")
                     if n_clv > 0:
                         clv_medio = somma_clv/n_clv
                         st.write(f"**CLV medio**: {clv_medio:+.2f}% ({n_clv_pos/n_clv*100:.1f}% scommesse con CLV positivo)")
-                    st.caption("⚠️ Backtest su quote storiche medie: ignora costi/limiti pratici reali. "
+                    st.caption("⚠️ Percentuale di vittoria calcolata sulle quote storiche. "
                                "Nota: le colonne PSCH/PSCD/PSCA (Pinnacle closing) sono segnalate come inaffidabili "
                                "da football-data.co.uk dal 23/07/2025 — interpreta il CLV con cautela.")
