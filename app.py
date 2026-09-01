@@ -1,14 +1,21 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date
+import requests
+import json
+import os
+from datetime import date, datetime
 from scipy.stats import poisson
 from scipy.optimize import minimize_scalar
 
 st.set_page_config(page_title="Poisson Betting Model", page_icon="🔮", layout="centered")
 
 # =====================================================================
-# 📊 DATABASE CAMPIONATI (stesso elenco del tool Jupyter V16)
+# 📊 DATABASE CAMPIONATI
+# I campionati "solo_previsione" (Champions/Europa League) usano football-data.org
+# (serve una chiave API gratuita, vedi sidebar) e NON hanno colonne di quote
+# bookmaker: previsione Poisson sì, value finder/backtest/CLV no — la fonte
+# dati semplicemente non li fornisce.
 # =====================================================================
 CAMPIONATI = {
     "Italia - Serie A":              {"id_fd": "I1"},
@@ -25,7 +32,11 @@ CAMPIONATI = {
     "Portogallo - Primeira Liga":     {"id_fd": "P1"},
     "Belgio - Pro League":            {"id_fd": "B1"},
     "Turchia - Süper Lig":            {"id_fd": "T1"},
+    "🌍 Champions League (solo previsione)": {"id_fdorg": "CL", "solo_previsione": True},
+    "🌍 Europa League (solo previsione)":    {"id_fdorg": "EL", "solo_previsione": True},
 }
+
+FILE_CLV_PERSONALE = "clv_personale.json"
 
 EWMA_SPAN = 6
 GIORNI_EMIVITA_DECADIMENTO = 180
@@ -220,6 +231,78 @@ def carica_fixture_future(id_fd):
 
 
 # =====================================================================
+# 🌍 CHAMPIONS/EUROPA LEAGUE — solo previsione, via football-data.org
+# Nessuna colonna di quote bookmaker in questa fonte: value finder, backtest
+# e CLV non sono disponibili per queste competizioni, solo la previsione
+# Poisson pura (1X2, gol/no gol, over/under, risultato esatto).
+# =====================================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def carica_dati_fdorg(codice_comp, api_key):
+    if not api_key:
+        return None
+    url = f"https://api.football-data.org/v4/competitions/{codice_comp}/matches"
+    headers = {"X-Auth-Token": api_key}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
+        dati_json = resp.json()
+        righe = []
+        for m in dati_json.get("matches", []):
+            finita = m.get("status") == "FINISHED"
+            righe.append({
+                "HomeTeam": m["homeTeam"]["name"],
+                "AwayTeam": m["awayTeam"]["name"],
+                "Date": m["utcDate"][:10],
+                "FTHG": m["score"]["fullTime"]["home"] if finita else np.nan,
+                "FTAG": m["score"]["fullTime"]["away"] if finita else np.nan,
+            })
+        if not righe:
+            return None
+        df = pd.DataFrame(righe)
+        df['Date_parsed'] = pd.to_datetime(df['Date'], errors='coerce')
+        df['Stagione'] = 'corrente'
+        return df.sort_values('Date_parsed').reset_index(drop=True)
+    except Exception:
+        return None
+
+
+# =====================================================================
+# 📌 REGISTRO CLV PERSONALE — "impara nel tempo"
+# Per le partite future, football-data.co.uk non ha ancora una vera quota di
+# chiusura (la partita non è stata giocata). Qui teniamo traccia noi stessi:
+# alla PRIMA volta che analizzi una partita, salviamo la quota vista in quel
+# momento. Ogni volta che la riguardi (anche dopo che la partita è stata
+# giocata e ha una chiusura ufficiale), il sistema confronta con quella prima
+# rilevazione, mostrandoti il movimento reale sui TUOI tempi di consultazione.
+#
+# LIMITE — su hosting gratuito (Streamlit Community Cloud) questo file può
+# azzerarsi se il server si riavvia dopo inattività prolungata o dopo un
+# aggiornamento del codice: non è un bug, è un limite del piano gratuito.
+# =====================================================================
+def carica_registro_clv():
+    if os.path.exists(FILE_CLV_PERSONALE):
+        try:
+            with open(FILE_CLV_PERSONALE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def salva_registro_clv(registro):
+    try:
+        with open(FILE_CLV_PERSONALE, "w") as f:
+            json.dump(registro, f)
+    except Exception:
+        pass
+
+
+def chiave_partita(id_camp, partita):
+    return f"{id_camp}|{partita.get('HomeTeam','?')}|{partita.get('AwayTeam','?')}|{str(partita.get('Date','?'))}"
+
+
+# =====================================================================
 # 🖥️ INTERFACCIA
 # =====================================================================
 st.title("🔮 Poisson Betting Model")
@@ -228,19 +311,52 @@ st.caption("Dixon-Coles + EWMA + Time Decay — versione web del tool Jupyter V1
 if "rho" not in st.session_state:
     st.session_state.rho = -0.10
 
+with st.sidebar:
+    st.subheader("⚙️ Impostazioni")
+    api_key_fdorg = st.text_input(
+        "Chiave API football-data.org (solo per Champions/Europa League)",
+        type="password",
+        help="Gratuita: registrati su football-data.org/client/register. "
+             "Non serve per i campionati domestici, solo per le competizioni europee."
+    )
+    if st.button("🔄 Aggiorna quote/fixture ora (forza dati freschi)"):
+        carica_fixture_future.clear()
+        carica_dati_fdorg.clear()
+        st.success("Cache svuotata: al prossimo caricamento i dati saranno quelli attuali.")
+
 campionato = st.selectbox("Torneo", list(CAMPIONATI.keys()))
-id_fd = CAMPIONATI[campionato]["id_fd"]
+info_campionato = CAMPIONATI[campionato]
+solo_previsione = info_campionato.get("solo_previsione", False)
 
-with st.spinner("Caricamento dati..."):
-    dati = carica_dati_campionato(id_fd)
-    fixture_future = carica_fixture_future(id_fd)
+if solo_previsione:
+    st.warning("🌍 Competizione europea: solo previsione Poisson. Niente quote di mercato, "
+               "value finder, backtest o CLV — football-data.org non fornisce quote bookmaker.")
+    with st.spinner("Caricamento dati..."):
+        dati = carica_dati_fdorg(info_campionato["id_fdorg"], api_key_fdorg)
+    fixture_future = pd.DataFrame()
+    if dati is None:
+        if not api_key_fdorg:
+            st.info("Inserisci una chiave API di football-data.org nella barra laterale per usare questa competizione.")
+        else:
+            st.error("Impossibile scaricare i dati (chiave non valida o servizio non raggiungibile).")
+        st.stop()
+    # Le fixture future per le competizioni europee sono le partite non ancora
+    # giocate presenti nello stesso dataset (status diverso da FINISHED).
+    fixture_future = dati[dati['FTHG'].isna()].copy()
+    dati = dati[dati['FTHG'].notna()].copy()
+    id_fd = info_campionato["id_fdorg"]
+else:
+    id_fd = info_campionato["id_fd"]
+    with st.spinner("Caricamento dati..."):
+        dati = carica_dati_campionato(id_fd)
+        fixture_future = carica_fixture_future(id_fd)
+    if dati is None:
+        st.error("Impossibile scaricare i dati per questo campionato.")
+        st.stop()
 
-if dati is None:
-    st.error("Impossibile scaricare i dati per questo campionato.")
-    st.stop()
-
-n_corrente = int(((dati['Stagione'] == 'corrente') & (dati['FTHG'].notna())).sum())
-st.info(f"📊 Partite di stagione corrente già giocate e disponibili: **{n_corrente}**")
+if 'Stagione' in dati.columns:
+    n_corrente = int(((dati['Stagione'] == 'corrente') & (dati['FTHG'].notna())).sum())
+    st.info(f"📊 Partite di stagione corrente già giocate e disponibili: **{n_corrente}**")
 
 tab_analisi, tab_rho, tab_backtest = st.tabs(["🔮 Analisi Partita", "🎯 Stima ρ", "📈 Backtest"])
 
@@ -315,11 +431,44 @@ with tab_analisi:
                         {"Segno": "X", "Mercato": f"{quote['q_x_equa']:.2f}", "Modello": f"{qm_x:.2f}", "Score": f"{scx:.0f}", "Giudizio": msgx},
                         {"Segno": "2", "Mercato": f"{quote['q_trasf_equa']:.2f}", "Modello": f"{qm_2:.2f}", "Score": f"{sc2:.0f}", "Giudizio": msg2},
                     ]))
+
+                    # FIX APP #1 — Registro CLV personale ("impara nel tempo").
+                    # Alla prima volta che guardi questa partita salviamo la quota;
+                    # ogni volta dopo (anche a partita giocata) confrontiamo con quella
+                    # prima rilevazione, sui TUOI tempi reali di consultazione.
+                    registro = carica_registro_clv()
+                    chiave = chiave_partita(id_fd, partita)
+                    if chiave not in registro:
+                        registro[chiave] = {
+                            "q1": quote['q_casa_grezza'], "qx": quote['q_x_grezza'], "q2": quote['q_trasf_grezza'],
+                            "rilevata_il": datetime.now().isoformat(timespec="minutes"),
+                        }
+                        salva_registro_clv(registro)
+                        st.caption("📌 Prima rilevazione quote salvata per questa partita — "
+                                   "al prossimo controllo vedrai qui il movimento rispetto a ora.")
+                    else:
+                        prima = registro[chiave]
+                        mov1 = (quote['q_casa_grezza']/prima['q1'] - 1)*100
+                        movx = (quote['q_x_grezza']/prima['qx'] - 1)*100
+                        mov2 = (quote['q_trasf_grezza']/prima['q2'] - 1)*100
+                        st.write(f"**📌 Movimento quote dalla tua prima rilevazione** ({prima['rilevata_il']}):")
+                        st.table(pd.DataFrame([
+                            {"Segno": "1", "Prima rilevazione": f"{prima['q1']:.2f}", "Ora": f"{quote['q_casa_grezza']:.2f}", "Variazione": f"{mov1:+.1f}%"},
+                            {"Segno": "X", "Prima rilevazione": f"{prima['qx']:.2f}", "Ora": f"{quote['q_x_grezza']:.2f}", "Variazione": f"{movx:+.1f}%"},
+                            {"Segno": "2", "Prima rilevazione": f"{prima['q2']:.2f}", "Ora": f"{quote['q_trasf_grezza']:.2f}", "Variazione": f"{mov2:+.1f}%"},
+                        ]))
+                        if pd.notna(partita.get('FTHG')):
+                            st.caption("La partita è già stata giocata: questo è il movimento completo "
+                                       "dalla tua prima rilevazione fino alla chiusura del mercato.")
                 else:
                     st.caption("Quote di mercato non disponibili per questa partita.")
 
 # ---------- TAB STIMA RHO ----------
 with tab_rho:
+    if solo_previsione:
+        st.caption("ℹ️ Su questa competizione la stima ρ userà tutti i dati disponibili come train "
+                   "(football-data.org non fornisce qui una stagione precedente separata) — "
+                   "nessuna validazione out-of-sample per ora.")
     st.write(f"ρ attuale in uso: **{st.session_state.rho:+.3f}**")
     st.caption("Calibrato per massima verosimiglianza SOLO sulla stagione precedente (train). "
                "Se disponibile, valuta anche la generalizzazione sulla stagione corrente (test).")
@@ -378,6 +527,10 @@ with tab_rho:
 
 # ---------- TAB BACKTEST ----------
 with tab_backtest:
+    if solo_previsione:
+        st.info("📊 Backtest non disponibile per le competizioni europee: football-data.org "
+                "non fornisce quote di mercato, quindi non c'è nulla su cui calcolare valore o ROI.")
+        st.stop()
     soglia = st.slider("Soglia score", 0, 90, 50, 10)
     usa_oos = st.checkbox("Valida SOLO su stagione corrente (out-of-sample, consigliato)", value=True)
     usa_kelly = st.checkbox("Usa Kelly frazionario (altrimenti stake fissa 1 unità)", value=True)
