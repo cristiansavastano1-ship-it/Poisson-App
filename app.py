@@ -603,3 +603,82 @@ with tab_backtest:
                     st.caption("⚠️ Percentuale di vittoria calcolata sulle quote storiche. "
                                "Nota: le colonne PSCH/PSCD/PSCA (Pinnacle closing) sono segnalate come inaffidabili "
                                "da football-data.co.uk dal 23/07/2025 — interpreta il CLV con cautela.")
+
+    st.divider()
+    st.write("**📊 Confronta soglie diverse in un colpo solo**")
+    st.caption("Se lo score porta segnale reale, salendo con la soglia il win rate/CLV dovrebbero "
+               "migliorare. Se restano piatti, lo score non sta filtrando nulla di utile.")
+
+    if st.button("📊 Confronta soglie"):
+        with st.spinner("Calcolo in corso (una sola passata sui dati per tutte le soglie)..."):
+            colonne_quote = classifica_colonne_quote(dati.columns)
+            qh, qd, qa = colonne_quote["apertura"]
+            ch_h, ch_d, ch_a = colonne_quote["chiusura"]
+            clv_disp = bool(ch_h and ch_d and ch_a)
+
+            tutte = dati[dati['FTHG'].notna()].reset_index(drop=True)
+            ha_stagione = 'Stagione' in tutte.columns
+
+            if usa_oos and ha_stagione:
+                indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
+            else:
+                indici = list(range(15, len(tutte)))
+
+            SOGLIE_CONFRONTO = [0, 30, 50, 70]
+            stat = {s: {"n_bet": 0, "n_win": 0, "somma_clv": 0.0, "n_clv": 0, "n_clv_pos": 0} for s in SOGLIE_CONFRONTO}
+
+            if not indici:
+                st.warning("⚠️ Nessuna partita di stagione corrente disponibile per il confronto.")
+            else:
+                for i in indici:
+                    partita = tutte.iloc[i]
+                    prec = tutte.iloc[:i]
+                    m = calcola_modello(prec, partita['HomeTeam'], partita['AwayTeam'],
+                                         st.session_state.rho, data_riferimento=partita.get('Date_parsed'))
+                    if m is None: continue
+                    quote = quote_mercato_normalizzate(partita, qh, qd, qa)
+                    if quote is None: continue
+                    quote_ch = quote_mercato_normalizzate(partita, ch_h, ch_d, ch_a) if clv_disp else None
+
+                    qm1, qmx, qm2 = 100/max(1,m['prob_1']), 100/max(1,m['prob_X']), 100/max(1,m['prob_2'])
+                    sc1,_ = valuta_affidabilita(quote['q_casa_equa'], qm1, m['n_storico'])
+                    scx,_ = valuta_affidabilita(quote['q_x_equa'], qmx, m['n_storico'])
+                    sc2,_ = valuta_affidabilita(quote['q_trasf_equa'], qm2, m['n_storico'])
+                    esito = '1' if partita['FTHG']>partita['FTAG'] else ('2' if partita['FTHG']<partita['FTAG'] else 'X')
+
+                    quote_grezze = {'1': quote['q_casa_grezza'], 'X': quote['q_x_grezza'], '2': quote['q_trasf_grezza']}
+                    quote_chiusura = {
+                        '1': quote_ch['q_casa_grezza'] if quote_ch else None,
+                        'X': quote_ch['q_x_grezza'] if quote_ch else None,
+                        '2': quote_ch['q_trasf_grezza'] if quote_ch else None,
+                    }
+                    score_per_segno = {'1': sc1, 'X': scx, '2': sc2}
+
+                    for segno, score in score_per_segno.items():
+                        vinta = (segno == esito)
+                        q_chiusura = quote_chiusura[segno]
+                        for s in SOGLIE_CONFRONTO:
+                            if score < s: continue
+                            stat[s]["n_bet"] += 1
+                            if vinta: stat[s]["n_win"] += 1
+                            if q_chiusura:
+                                clv_pct = (quote_grezze[segno]/q_chiusura - 1)*100
+                                stat[s]["somma_clv"] += clv_pct
+                                stat[s]["n_clv"] += 1
+                                if clv_pct > 0: stat[s]["n_clv_pos"] += 1
+
+                righe = []
+                for s in SOGLIE_CONFRONTO:
+                    d = stat[s]
+                    win_rate = (d["n_win"]/d["n_bet"]*100) if d["n_bet"] > 0 else None
+                    clv_medio = (d["somma_clv"]/d["n_clv"]) if d["n_clv"] > 0 else None
+                    righe.append({
+                        "Soglia": s,
+                        "Scommesse": d["n_bet"],
+                        "Win rate": f"{win_rate:.1f}%" if win_rate is not None else "—",
+                        "CLV medio": f"{clv_medio:+.2f}%" if clv_medio is not None else "—",
+                    })
+                st.table(pd.DataFrame(righe))
+                st.caption("Nota: a soglie alte il numero di scommesse cala molto — con pochi casi "
+                           "un win rate/CLV migliore può essere anche solo rumore statistico, non "
+                           "necessariamente un segnale affidabile. Guarda anche quante scommesse restano.")
