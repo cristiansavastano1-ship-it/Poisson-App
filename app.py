@@ -113,6 +113,21 @@ def calcola_modello(giocate, squadra_casa, squadra_trasferta, rho, data_riferime
     att_trasf_st = (m_gf_t / m_gol_trasf) if m_gf_t is not None else 1.0
     dif_trasf_st = (m_gs_t / m_gol_casa) if m_gs_t is not None else 1.0
 
+    # FIX #19 — SHRINKAGE verso la media di lega (1.0) per campioni piccoli.
+    # Con poche partite specifiche (neopromosse, inizio stagione) il rapporto
+    # attacco/difesa calcolato sopra è rumoroso. Lo "tiriamo" verso 1.0 (media
+    # di lega) in proporzione a quante partite specifiche abbiamo: K_SHRINKAGE
+    # è il numero di partite dopo il quale il dato specifico pesa metà e metà
+    # con la media di lega — sotto K conta di più la media, sopra K conta di
+    # più il dato osservato.
+    K_SHRINKAGE = 10
+    peso_casa = len(forma_casa) / (len(forma_casa) + K_SHRINKAGE)
+    peso_trasf = len(forma_trasf) / (len(forma_trasf) + K_SHRINKAGE)
+    att_casa_st = peso_casa * att_casa_st + (1 - peso_casa) * 1.0
+    dif_casa_st = peso_casa * dif_casa_st + (1 - peso_casa) * 1.0
+    att_trasf_st = peso_trasf * att_trasf_st + (1 - peso_trasf) * 1.0
+    dif_trasf_st = peso_trasf * dif_trasf_st + (1 - peso_trasf) * 1.0
+
     att_casa = att_casa_st * 0.70 + ((gf_casa_rec / max(0.1, m_gol_casa)) * pericolo_casa) * 0.30
     dif_casa = dif_casa_st * 0.70 + (gs_casa_rec / max(0.1, m_gol_trasf)) * 0.30
     att_trasf = att_trasf_st * 0.70 + ((gf_trasf_rec / max(0.1, m_gol_trasf)) * pericolo_trasf) * 0.30
@@ -150,7 +165,8 @@ def calcola_modello(giocate, squadra_casa, squadra_trasferta, rho, data_riferime
     return {"n_storico": n_storico, "lambda_casa": lam_c, "lambda_trasferta": lam_t,
             "prob_1": prob_1, "prob_X": prob_x, "prob_2": prob_2,
             "prob_goal": prob_goal, "prob_nogoal": prob_nogoal,
-            "prob_under": prob_under, "risultati": risultati}
+            "prob_under": prob_under, "risultati": risultati,
+            "n_partite_casa": len(forma_casa), "n_partite_trasferta": len(forma_trasf)}
 
 
 def classifica_colonne_quote(colonne):
@@ -185,6 +201,25 @@ def valuta_affidabilita(quota_book_norm, quota_macchina, n_storico):
     if score >= 70: return score, "🔥 ALTA AFFIDABILITÀ"
     elif score >= 50: return score, "⚠️ MEDIA AFFIDABILITÀ"
     return score, "🛑 BASSA AFFIDABILITÀ"
+
+
+# =====================================================================
+# 🔧 FIX #20 — BLENDING CON IL MERCATO
+# Il modello puro può discostarsi dal mercato per rumore statistico, non
+# solo per un vero edge — il mercato incorpora informazioni (infortuni,
+# formazioni, notizie) che il modello storico non vede. Mescoliamo la
+# probabilità del modello con quella implicita nel mercato (quota equa,
+# già depurata dall'overround) per ottenere uno score più prudente.
+# Usato SOLO per il value finder (score/backtest), non per le probabilità
+# "pure" mostrate come previsione principale — quelle restano il modello
+# non filtrato, per trasparenza.
+# =====================================================================
+PESO_MODELLO_BLENDING = 0.70  # il restante 0.30 va al mercato
+
+def quota_sfumata(prob_modello_pct, quota_equa_mercato):
+    prob_mercato_pct = 100.0 / quota_equa_mercato
+    prob_sfumata = PESO_MODELLO_BLENDING * prob_modello_pct + (1 - PESO_MODELLO_BLENDING) * prob_mercato_pct
+    return 100.0 / max(0.01, prob_sfumata)
 
 
 # =====================================================================
@@ -399,6 +434,22 @@ with tab_analisi:
                 if pd.notna(partita.get('FTHG')):
                     st.success(f"Risultato reale: {int(partita['FTHG'])} - {int(partita['FTAG'])}")
 
+                # FIX APP #2 — avviso trasparenza dati: se una delle due squadre ha
+                # pochissime partite specifiche nello storico (es. neopromossa,
+                # inizio stagione), la stima per quella squadra è meno affidabile
+                # anche se il campione di lega complessivo (n_storico) è ampio.
+                SOGLIA_AVVISO_POCHE_PARTITE = 5
+                squadre_scarse = []
+                if modello["n_partite_casa"] < SOGLIA_AVVISO_POCHE_PARTITE:
+                    squadre_scarse.append(f"{partita['HomeTeam']} (solo {modello['n_partite_casa']} partite in casa nello storico)")
+                if modello["n_partite_trasferta"] < SOGLIA_AVVISO_POCHE_PARTITE:
+                    squadre_scarse.append(f"{partita['AwayTeam']} (solo {modello['n_partite_trasferta']} partite in trasferta nello storico)")
+                if squadre_scarse:
+                    st.warning("⚠️ Stima poco affidabile: " + " e ".join(squadre_scarse) +
+                               " — probabile neopromossa o inizio stagione. Il modello compensa "
+                               "parzialmente con le medie di lega, ma con così pochi dati specifici "
+                               "la previsione va presa con più cautela del solito.")
+
                 c1, c2, c3 = st.columns(3)
                 c1.metric("1 (Casa)", f"{modello['prob_1']:.1f}%")
                 c2.metric("X (Pareggio)", f"{modello['prob_X']:.1f}%")
@@ -420,9 +471,11 @@ with tab_analisi:
                 quote = quote_mercato_normalizzate(partita, *colonne_quote["apertura"])
                 if quote:
                     st.write(f"**Analisi Valore** (media {quote['n_bookmakers']} bookmaker, margine {(quote['overround']-1)*100:.1f}%)")
-                    qm_1 = 100/max(1, modello['prob_1'])
-                    qm_x = 100/max(1, modello['prob_X'])
-                    qm_2 = 100/max(1, modello['prob_2'])
+                    st.caption(f"Quota 'Modello' qui sotto è sfumata {int(PESO_MODELLO_BLENDING*100)}% modello / "
+                               f"{int((1-PESO_MODELLO_BLENDING)*100)}% mercato — riduce i falsi segnali di valore.")
+                    qm_1 = quota_sfumata(modello['prob_1'], quote['q_casa_equa'])
+                    qm_x = quota_sfumata(modello['prob_X'], quote['q_x_equa'])
+                    qm_2 = quota_sfumata(modello['prob_2'], quote['q_trasf_equa'])
                     sc1, msg1 = valuta_affidabilita(quote['q_casa_equa'], qm_1, modello['n_storico'])
                     scx, msgx = valuta_affidabilita(quote['q_x_equa'], qm_x, modello['n_storico'])
                     sc2, msg2 = valuta_affidabilita(quote['q_trasf_equa'], qm_2, modello['n_storico'])
@@ -567,7 +620,7 @@ with tab_backtest:
                     if quote is None: continue
                     quote_ch = quote_mercato_normalizzate(partita, ch_h, ch_d, ch_a) if clv_disp else None
 
-                    qm1, qmx, qm2 = 100/max(1,m['prob_1']), 100/max(1,m['prob_X']), 100/max(1,m['prob_2'])
+                    qm1, qmx, qm2 = quota_sfumata(m['prob_1'], quote['q_casa_equa']), quota_sfumata(m['prob_X'], quote['q_x_equa']), quota_sfumata(m['prob_2'], quote['q_trasf_equa'])
                     sc1,_ = valuta_affidabilita(quote['q_casa_equa'], qm1, m['n_storico'])
                     scx,_ = valuta_affidabilita(quote['q_x_equa'], qmx, m['n_storico'])
                     sc2,_ = valuta_affidabilita(quote['q_trasf_equa'], qm2, m['n_storico'])
@@ -640,7 +693,7 @@ with tab_backtest:
                     if quote is None: continue
                     quote_ch = quote_mercato_normalizzate(partita, ch_h, ch_d, ch_a) if clv_disp else None
 
-                    qm1, qmx, qm2 = 100/max(1,m['prob_1']), 100/max(1,m['prob_X']), 100/max(1,m['prob_2'])
+                    qm1, qmx, qm2 = quota_sfumata(m['prob_1'], quote['q_casa_equa']), quota_sfumata(m['prob_X'], quote['q_x_equa']), quota_sfumata(m['prob_2'], quote['q_trasf_equa'])
                     sc1,_ = valuta_affidabilita(quote['q_casa_equa'], qm1, m['n_storico'])
                     scx,_ = valuta_affidabilita(quote['q_x_equa'], qmx, m['n_storico'])
                     sc2,_ = valuta_affidabilita(quote['q_trasf_equa'], qm2, m['n_storico'])
