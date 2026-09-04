@@ -204,25 +204,6 @@ def valuta_affidabilita(quota_book_norm, quota_macchina, n_storico):
 
 
 # =====================================================================
-# 🔧 FIX #20 — BLENDING CON IL MERCATO
-# Il modello puro può discostarsi dal mercato per rumore statistico, non
-# solo per un vero edge — il mercato incorpora informazioni (infortuni,
-# formazioni, notizie) che il modello storico non vede. Mescoliamo la
-# probabilità del modello con quella implicita nel mercato (quota equa,
-# già depurata dall'overround) per ottenere uno score più prudente.
-# Usato SOLO per il value finder (score/backtest), non per le probabilità
-# "pure" mostrate come previsione principale — quelle restano il modello
-# non filtrato, per trasparenza.
-# =====================================================================
-PESO_MODELLO_BLENDING = 0.70  # il restante 0.30 va al mercato
-
-def quota_sfumata(prob_modello_pct, quota_equa_mercato):
-    prob_mercato_pct = 100.0 / quota_equa_mercato
-    prob_sfumata = PESO_MODELLO_BLENDING * prob_modello_pct + (1 - PESO_MODELLO_BLENDING) * prob_mercato_pct
-    return 100.0 / max(0.01, prob_sfumata)
-
-
-# =====================================================================
 # 📥 CARICAMENTO DATI (cache 1 ora — evita di riscaricare a ogni click)
 # =====================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -471,11 +452,9 @@ with tab_analisi:
                 quote = quote_mercato_normalizzate(partita, *colonne_quote["apertura"])
                 if quote:
                     st.write(f"**Analisi Valore** (media {quote['n_bookmakers']} bookmaker, margine {(quote['overround']-1)*100:.1f}%)")
-                    st.caption(f"Quota 'Modello' qui sotto è sfumata {int(PESO_MODELLO_BLENDING*100)}% modello / "
-                               f"{int((1-PESO_MODELLO_BLENDING)*100)}% mercato — riduce i falsi segnali di valore.")
-                    qm_1 = quota_sfumata(modello['prob_1'], quote['q_casa_equa'])
-                    qm_x = quota_sfumata(modello['prob_X'], quote['q_x_equa'])
-                    qm_2 = quota_sfumata(modello['prob_2'], quote['q_trasf_equa'])
+                    qm_1 = 100/max(1, modello['prob_1'])
+                    qm_x = 100/max(1, modello['prob_X'])
+                    qm_2 = 100/max(1, modello['prob_2'])
                     sc1, msg1 = valuta_affidabilita(quote['q_casa_equa'], qm_1, modello['n_storico'])
                     scx, msgx = valuta_affidabilita(quote['q_x_equa'], qm_x, modello['n_storico'])
                     sc2, msg2 = valuta_affidabilita(quote['q_trasf_equa'], qm_2, modello['n_storico'])
@@ -620,7 +599,7 @@ with tab_backtest:
                     if quote is None: continue
                     quote_ch = quote_mercato_normalizzate(partita, ch_h, ch_d, ch_a) if clv_disp else None
 
-                    qm1, qmx, qm2 = quota_sfumata(m['prob_1'], quote['q_casa_equa']), quota_sfumata(m['prob_X'], quote['q_x_equa']), quota_sfumata(m['prob_2'], quote['q_trasf_equa'])
+                    qm1, qmx, qm2 = 100/max(1,m['prob_1']), 100/max(1,m['prob_X']), 100/max(1,m['prob_2'])
                     sc1,_ = valuta_affidabilita(quote['q_casa_equa'], qm1, m['n_storico'])
                     scx,_ = valuta_affidabilita(quote['q_x_equa'], qmx, m['n_storico'])
                     sc2,_ = valuta_affidabilita(quote['q_trasf_equa'], qm2, m['n_storico'])
@@ -693,7 +672,7 @@ with tab_backtest:
                     if quote is None: continue
                     quote_ch = quote_mercato_normalizzate(partita, ch_h, ch_d, ch_a) if clv_disp else None
 
-                    qm1, qmx, qm2 = quota_sfumata(m['prob_1'], quote['q_casa_equa']), quota_sfumata(m['prob_X'], quote['q_x_equa']), quota_sfumata(m['prob_2'], quote['q_trasf_equa'])
+                    qm1, qmx, qm2 = 100/max(1,m['prob_1']), 100/max(1,m['prob_X']), 100/max(1,m['prob_2'])
                     sc1,_ = valuta_affidabilita(quote['q_casa_equa'], qm1, m['n_storico'])
                     scx,_ = valuta_affidabilita(quote['q_x_equa'], qmx, m['n_storico'])
                     sc2,_ = valuta_affidabilita(quote['q_trasf_equa'], qm2, m['n_storico'])
