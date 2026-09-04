@@ -37,6 +37,7 @@ CAMPIONATI = {
 }
 
 FILE_CLV_PERSONALE = "clv_personale.json"
+FILE_STORICO_SOGLIE = "storico_soglie.json"
 
 EWMA_SPAN = 6
 GIORNI_EMIVITA_DECADIMENTO = 180
@@ -316,6 +317,31 @@ def salva_registro_clv(registro):
 
 def chiave_partita(id_camp, partita):
     return f"{id_camp}|{partita.get('HomeTeam','?')}|{partita.get('AwayTeam','?')}|{str(partita.get('Date','?'))}"
+
+
+# =====================================================================
+# 📜 STORICO CONFRONTI SOGLIA — salvataggio automatico
+# Ogni volta che lanci "Confronta soglie" il risultato viene aggiunto qui,
+# invece di doverlo trascrivere a mano su Excel per confrontare nel tempo.
+# Stesso limite del registro CLV: su hosting gratuito può azzerarsi se il
+# server si riavvia dopo inattività prolungata.
+# =====================================================================
+def carica_storico_soglie():
+    if os.path.exists(FILE_STORICO_SOGLIE):
+        try:
+            with open(FILE_STORICO_SOGLIE) as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def salva_storico_soglie(storico):
+    try:
+        with open(FILE_STORICO_SOGLIE, "w") as f:
+            json.dump(storico, f)
+    except Exception:
+        pass
 
 
 # =====================================================================
@@ -700,6 +726,7 @@ with tab_backtest:
                                 if clv_pct > 0: stat[s]["n_clv_pos"] += 1
 
                 righe = []
+                record_soglie = {}
                 for s in SOGLIE_CONFRONTO:
                     d = stat[s]
                     win_rate = (d["n_win"]/d["n_bet"]*100) if d["n_bet"] > 0 else None
@@ -710,7 +737,47 @@ with tab_backtest:
                         "Win rate": f"{win_rate:.1f}%" if win_rate is not None else "—",
                         "CLV medio": f"{clv_medio:+.2f}%" if clv_medio is not None else "—",
                     })
+                    record_soglie[str(s)] = {"n_bet": d["n_bet"], "win_rate": win_rate, "clv_medio": clv_medio}
                 st.table(pd.DataFrame(righe))
                 st.caption("Nota: a soglie alte il numero di scommesse cala molto — con pochi casi "
                            "un win rate/CLV migliore può essere anche solo rumore statistico, non "
                            "necessariamente un segnale affidabile. Guarda anche quante scommesse restano.")
+
+                # Salvataggio automatico nello storico — niente più copia-incolla su Excel.
+                storico = carica_storico_soglie()
+                storico.append({
+                    "timestamp": datetime.now().isoformat(timespec="minutes"),
+                    "campionato": campionato,
+                    "out_of_sample": usa_oos,
+                    "soglie": record_soglie,
+                })
+                salva_storico_soglie(storico)
+                st.success("📌 Confronto salvato nello storico — lo trovi qui sotto in qualunque momento.")
+
+    # ---------- STORICO CONFRONTI SALVATI ----------
+    st.divider()
+    st.write("**📜 Storico confronti soglia salvati**")
+    storico = carica_storico_soglie()
+    storico_campionato = [r for r in storico if r.get("campionato") == campionato]
+    if not storico_campionato:
+        st.caption("Nessun confronto salvato ancora per questo campionato. "
+                   "Ogni volta che lanci '📊 Confronta soglie' qui sopra, il risultato viene aggiunto automaticamente.")
+    else:
+        righe_storico = []
+        for r in storico_campionato:
+            for soglia_str, d in r["soglie"].items():
+                righe_storico.append({
+                    "Data": r["timestamp"],
+                    "OOS": "sì" if r.get("out_of_sample") else "no",
+                    "Soglia": soglia_str,
+                    "Scommesse": d["n_bet"],
+                    "Win rate": f"{d['win_rate']:.1f}%" if d["win_rate"] is not None else "—",
+                    "CLV medio": f"{d['clv_medio']:+.2f}%" if d["clv_medio"] is not None else "—",
+                })
+        df_storico = pd.DataFrame(righe_storico).sort_values("Data", ascending=False)
+        st.dataframe(df_storico, hide_index=True, use_container_width=True)
+        if st.button("🗑️ Cancella storico di questo campionato"):
+            storico_rimasto = [r for r in storico if r.get("campionato") != campionato]
+            salva_storico_soglie(storico_rimasto)
+            st.success("Storico cancellato per questo campionato.")
+            st.rerun()
