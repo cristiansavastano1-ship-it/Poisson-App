@@ -4,6 +4,8 @@ import numpy as np
 import requests
 import json
 import os
+import io
+import time
 from datetime import date, datetime
 from scipy.stats import poisson
 from scipy.optimize import minimize_scalar
@@ -207,44 +209,74 @@ def valuta_affidabilita(quota_book_norm, quota_macchina, n_storico):
 # =====================================================================
 # 📥 CARICAMENTO DATI (cache 1 ora — evita di riscaricare a ogni click)
 # =====================================================================
+
+# FIX APP #3 — download CSV con User-Agent da browser + retry.
+# Streamlit Community Cloud condivide un pool ristretto di IP in uscita tra
+# migliaia di app: alcuni siti (specialmente sotto traffico alto, es. la
+# domenica durante le partite) possono bloccare o rallentare richieste che
+# sembrano "bot" (nessun User-Agent = comportamento tipico di script, non
+# di un browser). Qui simuliamo un browser vero e riproviamo un paio di
+# volte prima di arrenderci, riportando l'errore reale invece di un generico
+# "impossibile scaricare i dati".
+HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
+    """Scarica un CSV con header da browser e qualche tentativo prima di
+    arrendersi. Ritorna (dataframe, errore) — errore è None se riuscito."""
+    ultimo_errore = None
+    for tentativo in range(tentativi):
+        try:
+            resp = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
+            resp.raise_for_status()
+            df = pd.read_csv(io.StringIO(resp.text))
+            return df, None
+        except Exception as e:
+            ultimo_errore = str(e)
+            if tentativo < tentativi - 1:
+                time.sleep(attesa_secondi)
+    return None, ultimo_errore
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def carica_dati_campionato(id_fd):
     codice_corrente, codice_precedente = codici_stagione()
     frames = []
+    errori = []
     for codice, label in [(codice_precedente, 'precedente'), (codice_corrente, 'corrente')]:
-        try:
-            url = f"https://www.football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
-            df = pd.read_csv(url)
+        url = f"https://www.football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
+        df, errore = scarica_csv_robusto(url)
+        if df is not None:
             df.columns = df.columns.str.strip()
             df['Stagione'] = label
             frames.append(df)
-        except Exception:
-            pass
+        else:
+            errori.append(f"{label} ({codice}): {errore}")
     if not frames:
-        return None
+        return None, errori
     dati = pd.concat(frames, ignore_index=True, sort=False)
     dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce', dayfirst=True)
     dati = dati.sort_values('Date_parsed').reset_index(drop=True)
     dati = dati.drop_duplicates(subset=['Date_parsed', 'HomeTeam', 'AwayTeam'], keep='last').reset_index(drop=True)
-    return dati
+    return dati, errori
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def carica_fixture_future(id_fd):
-    try:
-        fx = pd.read_csv("https://www.football-data.co.uk/fixtures.csv")
-        fx.columns = fx.columns.str.strip()
-        if 'Div' not in fx.columns: return pd.DataFrame()
-        fx = fx[fx['Div'] == id_fd].copy()
-        if len(fx) == 0: return pd.DataFrame()
-        fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
-        oggi = pd.Timestamp(date.today())
-        fx = fx[fx['Date_parsed'] >= oggi]
-        fx['FTHG'] = np.nan
-        fx['FTAG'] = np.nan
-        return fx.sort_values('Date_parsed').reset_index(drop=True)
-    except Exception:
-        return pd.DataFrame()
+    df, errore = scarica_csv_robusto("https://www.football-data.co.uk/fixtures.csv")
+    if df is None:
+        return pd.DataFrame(), errore
+    fx = df.copy()
+    fx.columns = fx.columns.str.strip()
+    if 'Div' not in fx.columns: return pd.DataFrame(), None
+    fx = fx[fx['Div'] == id_fd].copy()
+    if len(fx) == 0: return pd.DataFrame(), None
+    fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
+    oggi = pd.Timestamp(date.today())
+    fx = fx[fx['Date_parsed'] >= oggi]
+    fx['FTHG'] = np.nan
+    fx['FTAG'] = np.nan
+    return fx.sort_values('Date_parsed').reset_index(drop=True), None
 
 
 # =====================================================================
@@ -364,6 +396,7 @@ with st.sidebar:
     if st.button("🔄 Aggiorna quote/fixture ora (forza dati freschi)"):
         carica_fixture_future.clear()
         carica_dati_fdorg.clear()
+        carica_dati_campionato.clear()
         st.success("Cache svuotata: al prossimo caricamento i dati saranno quelli attuali.")
 
 campionato = st.selectbox("Torneo", list(CAMPIONATI.keys()))
@@ -390,11 +423,19 @@ if solo_previsione:
 else:
     id_fd = info_campionato["id_fd"]
     with st.spinner("Caricamento dati..."):
-        dati = carica_dati_campionato(id_fd)
-        fixture_future = carica_fixture_future(id_fd)
+        dati, errori_dati = carica_dati_campionato(id_fd)
+        fixture_future, errore_fixture = carica_fixture_future(id_fd)
     if dati is None:
         st.error("Impossibile scaricare i dati per questo campionato.")
+        if errori_dati:
+            with st.expander("Dettagli tecnici dell'errore"):
+                for e in errori_dati:
+                    st.code(e)
+        st.info("Può succedere sotto traffico alto (es. la domenica durante le partite) — "
+                "prova a usare '🔄 Aggiorna quote/fixture ora' nella barra laterale o riprova tra qualche minuto.")
         st.stop()
+    if errore_fixture:
+        st.caption(f"ℹ️ Fixture future non caricate ({errore_fixture}) — mostro solo lo storico.")
 
 if 'Stagione' in dati.columns:
     n_corrente = int(((dati['Stagione'] == 'corrente') & (dati['FTHG'].notna())).sum())
