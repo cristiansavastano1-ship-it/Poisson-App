@@ -6,6 +6,7 @@ import json
 import os
 import io
 import time
+import pickle
 from datetime import date, datetime
 from scipy.stats import poisson
 from scipy.optimize import minimize_scalar
@@ -238,8 +239,41 @@ def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
     return None, ultimo_errore
 
 
+# =====================================================================
+# 🔧 FIX APP #4 — CACHE SU DISCO COME "PIANO B"
+# Se football-data.co.uk risponde con errore (es. 503 sotto carico), invece
+# di bloccarsi usiamo l'ultima copia scaricata con successo, salvata su
+# disco. L'app resta usabile con dati leggermente vecchi invece di essere
+# del tutto inutilizzabile durante un'interruzione del sito.
+# Stesso limite di sempre: su hosting gratuito, se il server si riavvia,
+# anche questa cache di emergenza può azzerarsi.
+# =====================================================================
+def _path_cache(prefisso, id_fd):
+    return f"{prefisso}_{id_fd}.pkl"
+
+
+def _salva_cache_disco(path, dati):
+    try:
+        with open(path, "wb") as f:
+            pickle.dump({"dati": dati, "timestamp": datetime.now().isoformat(timespec="minutes")}, f)
+    except Exception:
+        pass
+
+
+def _carica_cache_disco(path):
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+    return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def carica_dati_campionato(id_fd):
+    """Ritorna (dati, errori, fresco, timestamp_ultimo_successo)."""
+    path = _path_cache("cache_storico", id_fd)
     codice_corrente, codice_precedente = codici_stagione()
     frames = []
     errori = []
@@ -252,31 +286,56 @@ def carica_dati_campionato(id_fd):
             frames.append(df)
         else:
             errori.append(f"{label} ({codice}): {errore}")
-    if not frames:
-        return None, errori
-    dati = pd.concat(frames, ignore_index=True, sort=False)
-    dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce', dayfirst=True)
-    dati = dati.sort_values('Date_parsed').reset_index(drop=True)
-    dati = dati.drop_duplicates(subset=['Date_parsed', 'HomeTeam', 'AwayTeam'], keep='last').reset_index(drop=True)
-    return dati, errori
+
+    if frames:
+        dati = pd.concat(frames, ignore_index=True, sort=False)
+        dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce', dayfirst=True)
+        dati = dati.sort_values('Date_parsed').reset_index(drop=True)
+        dati = dati.drop_duplicates(subset=['Date_parsed', 'HomeTeam', 'AwayTeam'], keep='last').reset_index(drop=True)
+        _salva_cache_disco(path, dati)
+        return dati, errori, True, datetime.now().isoformat(timespec="minutes")
+
+    # Live fallito del tutto: proviamo il "piano B" — ultima copia buona su disco.
+    cache = _carica_cache_disco(path)
+    if cache is not None:
+        return cache["dati"], errori, False, cache["timestamp"]
+    return None, errori, False, None
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def carica_fixture_future(id_fd):
+    """Ritorna (fixture_df, errore, fresco, timestamp_ultimo_successo)."""
+    path = _path_cache("cache_fixture", id_fd)
     df, errore = scarica_csv_robusto("https://www.football-data.co.uk/fixtures.csv")
-    if df is None:
-        return pd.DataFrame(), errore
-    fx = df.copy()
-    fx.columns = fx.columns.str.strip()
-    if 'Div' not in fx.columns: return pd.DataFrame(), None
-    fx = fx[fx['Div'] == id_fd].copy()
-    if len(fx) == 0: return pd.DataFrame(), None
-    fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
-    oggi = pd.Timestamp(date.today())
-    fx = fx[fx['Date_parsed'] >= oggi]
-    fx['FTHG'] = np.nan
-    fx['FTAG'] = np.nan
-    return fx.sort_values('Date_parsed').reset_index(drop=True), None
+
+    if df is not None:
+        fx = df.copy()
+        fx.columns = fx.columns.str.strip()
+        if 'Div' in fx.columns:
+            fx = fx[fx['Div'] == id_fd].copy()
+            fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
+            oggi = pd.Timestamp(date.today())
+            fx = fx[fx['Date_parsed'] >= oggi]
+            fx['FTHG'] = np.nan
+            fx['FTAG'] = np.nan
+            fx = fx.sort_values('Date_parsed').reset_index(drop=True)
+            _salva_cache_disco(path, fx)
+            return fx, None, True, datetime.now().isoformat(timespec="minutes")
+        return pd.DataFrame(), None, True, datetime.now().isoformat(timespec="minutes")
+
+    # Live fallito: proviamo il "piano B" — ultima lista fixture salvata.
+    cache = _carica_cache_disco(path)
+    if cache is not None:
+        # Le fixture salvate potrebbero includere partite ormai passate
+        # rispetto a oggi: le filtriamo di nuovo prima di mostrarle.
+        fx_cache = cache["dati"]
+        if len(fx_cache) > 0 and 'Date_parsed' in fx_cache.columns:
+            oggi = pd.Timestamp(date.today())
+            fx_cache = fx_cache[fx_cache['Date_parsed'] >= oggi]
+        return fx_cache, errore, False, cache["timestamp"]
+    return pd.DataFrame(), errore, False, None
+
+
 
 
 # =====================================================================
@@ -423,10 +482,11 @@ if solo_previsione:
 else:
     id_fd = info_campionato["id_fd"]
     with st.spinner("Caricamento dati..."):
-        dati, errori_dati = carica_dati_campionato(id_fd)
-        fixture_future, errore_fixture = carica_fixture_future(id_fd)
+        dati, errori_dati, fresco_dati, ts_dati = carica_dati_campionato(id_fd)
+        fixture_future, errore_fixture, fresco_fixture, ts_fixture = carica_fixture_future(id_fd)
     if dati is None:
-        st.error("Impossibile scaricare i dati per questo campionato.")
+        st.error("Impossibile scaricare i dati per questo campionato (e nessuna copia di riserva "
+                 "salvata in precedenza per usarla come piano B).")
         if errori_dati:
             with st.expander("Dettagli tecnici dell'errore"):
                 for e in errori_dati:
@@ -434,7 +494,12 @@ else:
         st.info("Può succedere sotto traffico alto (es. la domenica durante le partite) — "
                 "prova a usare '🔄 Aggiorna quote/fixture ora' nella barra laterale o riprova tra qualche minuto.")
         st.stop()
-    if errore_fixture:
+    if not fresco_dati:
+        st.warning(f"⚠️ Il sito non è raggiungibile in questo momento — sto mostrando l'ultima copia "
+                   f"dei dati salvata con successo il **{ts_dati}**. Potrebbero mancare le partite più recenti.")
+    if not fresco_fixture and len(fixture_future) > 0:
+        st.caption(f"ℹ️ Fixture future non aggiornabili ora — mostro l'ultima lista salvata il {ts_fixture}.")
+    elif errore_fixture and fresco_fixture is False and len(fixture_future) == 0:
         st.caption(f"ℹ️ Fixture future non caricate ({errore_fixture}) — mostro solo lo storico.")
 
 if 'Stagione' in dati.columns:
