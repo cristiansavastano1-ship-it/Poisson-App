@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -63,6 +64,14 @@ def codici_stagione(oggi=None):
     anno_inizio_precedente = anno_inizio_corrente - 1
     fmt = lambda a: f"{a % 100:02d}{(a + 1) % 100:02d}"
     return fmt(anno_inizio_corrente), fmt(anno_inizio_precedente)
+
+
+def anni_stagione(oggi=None):
+    """Come codici_stagione, ma ritorna gli anni interi (es. 2026, 2025) —
+    formato richiesto dal parametro ?season= di football-data.org."""
+    oggi = oggi or date.today()
+    anno_inizio_corrente = oggi.year if oggi.month >= 7 else oggi.year - 1
+    return anno_inizio_corrente, anno_inizio_corrente - 1
 
 
 def tau_dixon_coles(gc, gt, lc, lt, rho):
@@ -348,40 +357,56 @@ def carica_fixture_future(id_fd):
 
 
 # =====================================================================
-# 🌍 CHAMPIONS/EUROPA LEAGUE — solo previsione, via football-data.org
+# 🌍 CHAMPIONS/EUROPA LEAGUE (e ponte di emergenza) — via football-data.org
 # Nessuna colonna di quote bookmaker in questa fonte: value finder, backtest
-# e CLV non sono disponibili per queste competizioni, solo la previsione
-# Poisson pura (1X2, gol/no gol, over/under, risultato esatto).
+# e CLV non sono disponibili, solo la previsione Poisson pura.
+#
+# FIX APP #6 — STAGIONE CORRENTE + PRECEDENTE (risolve il cold-start)
+# Di default l'API restituisce solo la stagione in corso: a inizio stagione
+# (es. il giorno stesso in cui parte la Champions League) questo significa
+# zero o pochissime partite giocate, quindi "pochi dati storici" anche
+# volendo. Interroghiamo esplicitamente anche la stagione precedente
+# (parametro ?season=) e concateniamo, stesso principio già usato per
+# football-data.co.uk — bonus: abilita anche lo split train/test per la
+# stima di ρ su queste competizioni.
 # =====================================================================
 @st.cache_data(ttl=900, show_spinner=False)
 def carica_dati_fdorg(codice_comp, api_key):
     if not api_key:
         return None
-    url = f"https://api.football-data.org/v4/competitions/{codice_comp}/matches"
+    anno_corrente, anno_precedente = anni_stagione()
     headers = {"X-Auth-Token": api_key}
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return None
-        dati_json = resp.json()
-        righe = []
-        for m in dati_json.get("matches", []):
-            finita = m.get("status") == "FINISHED"
-            righe.append({
-                "HomeTeam": m["homeTeam"]["name"],
-                "AwayTeam": m["awayTeam"]["name"],
-                "Date": m["utcDate"][:10],
-                "FTHG": m["score"]["fullTime"]["home"] if finita else np.nan,
-                "FTAG": m["score"]["fullTime"]["away"] if finita else np.nan,
-            })
-        if not righe:
-            return None
-        df = pd.DataFrame(righe)
-        df['Date_parsed'] = pd.to_datetime(df['Date'], errors='coerce')
-        df['Stagione'] = 'corrente'
-        return df.sort_values('Date_parsed').reset_index(drop=True)
-    except Exception:
+    frames = []
+
+    for anno, label in [(anno_precedente, 'precedente'), (anno_corrente, 'corrente')]:
+        url = f"https://api.football-data.org/v4/competitions/{codice_comp}/matches?season={anno}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                continue
+            dati_json = resp.json()
+            righe = []
+            for m in dati_json.get("matches", []):
+                finita = m.get("status") == "FINISHED"
+                righe.append({
+                    "HomeTeam": m["homeTeam"]["name"],
+                    "AwayTeam": m["awayTeam"]["name"],
+                    "Date": m["utcDate"][:10],
+                    "FTHG": m["score"]["fullTime"]["home"] if finita else np.nan,
+                    "FTAG": m["score"]["fullTime"]["away"] if finita else np.nan,
+                })
+            if righe:
+                df = pd.DataFrame(righe)
+                df['Stagione'] = label
+                frames.append(df)
+        except Exception:
+            continue
+
+    if not frames:
         return None
+    dati = pd.concat(frames, ignore_index=True, sort=False)
+    dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce')
+    return dati.sort_values('Date_parsed').reset_index(drop=True)
 
 
 # =====================================================================
