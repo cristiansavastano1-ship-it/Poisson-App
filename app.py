@@ -39,6 +39,15 @@ CAMPIONATI = {
     "🌍 Europa League (solo previsione)":    {"id_fdorg": "EL", "solo_previsione": True},
 }
 
+# FIX APP #5 — PONTE DI EMERGENZA verso football-data.org.
+# Usato SOLO quando football-data.co.uk è irraggiungibile E non c'è nessuna
+# copia di riserva su disco. Copre solo i campionati domestici presenti nel
+# piano gratuito di football-data.org — per gli altri non c'è ponte possibile.
+FDORG_CODICI_PONTE = {
+    "I1": "SA", "E0": "PL", "E1": "ELC", "SP1": "PD",
+    "D1": "BL1", "F1": "FL1", "N1": "DED", "P1": "PPL",
+}
+
 FILE_CLV_PERSONALE = "clv_personale.json"
 FILE_STORICO_SOGLIE = "storico_soglie.json"
 
@@ -484,23 +493,44 @@ else:
     with st.spinner("Caricamento dati..."):
         dati, errori_dati, fresco_dati, ts_dati = carica_dati_campionato(id_fd)
         fixture_future, errore_fixture, fresco_fixture, ts_fixture = carica_fixture_future(id_fd)
+
+    if dati is None and id_fd in FDORG_CODICI_PONTE and api_key_fdorg:
+        # FIX APP #5 — football-data.co.uk irraggiungibile E nessuna copia su
+        # disco: tentiamo il ponte verso football-data.org. Da qui in poi ci
+        # comportiamo come in modalità "solo previsione" (niente quote/value
+        # finder/backtest, quella fonte non le fornisce). Non appena
+        # football-data.co.uk torna raggiungibile, al prossimo caricamento
+        # questo blocco non scatta più — si torna alla modalità normale da sé.
+        with st.spinner("Fonte principale non raggiungibile, provo il ponte verso football-data.org..."):
+            dati_ponte = carica_dati_fdorg(FDORG_CODICI_PONTE[id_fd], api_key_fdorg)
+        if dati_ponte is not None:
+            st.warning("🌉 **Modalità ponte attiva**: football-data.co.uk non è raggiungibile, sto usando "
+                       "football-data.org come fonte temporanea. Solo previsione Poisson — niente quote, "
+                       "value finder, backtest o CLV finché la fonte principale non torna disponibile.")
+            solo_previsione = True
+            fixture_future = dati_ponte[dati_ponte['FTHG'].isna()].copy()
+            dati = dati_ponte[dati_ponte['FTHG'].notna()].copy()
+
     if dati is None:
-        st.error("Impossibile scaricare i dati per questo campionato (e nessuna copia di riserva "
-                 "salvata in precedenza per usarla come piano B).")
+        st.error("Impossibile scaricare i dati per questo campionato (nessuna copia di riserva su disco, "
+                 "e nessun ponte disponibile per questo campionato specifico o chiave API mancante).")
         if errori_dati:
             with st.expander("Dettagli tecnici dell'errore"):
                 for e in errori_dati:
                     st.code(e)
         st.info("Può succedere sotto traffico alto (es. la domenica durante le partite) — "
-                "prova a usare '🔄 Aggiorna quote/fixture ora' nella barra laterale o riprova tra qualche minuto.")
+                "prova a usare '🔄 Aggiorna quote/fixture ora' nella barra laterale o riprova tra qualche minuto. "
+                "Per un ponte automatico su questo campionato, inserisci una chiave API di football-data.org "
+                "nella barra laterale (funziona solo per i campionati coperti dal loro piano gratuito).")
         st.stop()
-    if not fresco_dati:
+    if not fresco_dati and not solo_previsione:
         st.warning(f"⚠️ Il sito non è raggiungibile in questo momento — sto mostrando l'ultima copia "
                    f"dei dati salvata con successo il **{ts_dati}**. Potrebbero mancare le partite più recenti.")
-    if not fresco_fixture and len(fixture_future) > 0:
-        st.caption(f"ℹ️ Fixture future non aggiornabili ora — mostro l'ultima lista salvata il {ts_fixture}.")
-    elif errore_fixture and fresco_fixture is False and len(fixture_future) == 0:
-        st.caption(f"ℹ️ Fixture future non caricate ({errore_fixture}) — mostro solo lo storico.")
+    if not solo_previsione:
+        if not fresco_fixture and len(fixture_future) > 0:
+            st.caption(f"ℹ️ Fixture future non aggiornabili ora — mostro l'ultima lista salvata il {ts_fixture}.")
+        elif errore_fixture and fresco_fixture is False and len(fixture_future) == 0:
+            st.caption(f"ℹ️ Fixture future non caricate ({errore_fixture}) — mostro solo lo storico.")
 
 if 'Stagione' in dati.columns:
     n_corrente = int(((dati['Stagione'] == 'corrente') & (dati['FTHG'].notna())).sum())
