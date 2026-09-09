@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,6 +8,7 @@ import os
 import io
 import time
 import pickle
+from sklearn.isotonic import IsotonicRegression
 from datetime import date, datetime
 from scipy.stats import poisson
 from scipy.optimize import minimize_scalar
@@ -302,6 +304,88 @@ def _carica_cache_disco(path):
     return None
 
 
+# =====================================================================
+# 🔧 FIX APP #9 — CALIBRAZIONE POST-HOC (isotonic regression per campionato)
+# La curva di calibrazione ha mostrato che il modello è sistematicamente
+# overconfident nella fascia 50-80% di probabilità, su tutti e 5 i
+# campionati testati (dati reali, campioni da 26 a 105 osservazioni per
+# fascia). Qui alleniamo un piccolo "correttore" per campionato che
+# riallinea le probabilità grezze del modello verso quello che succede
+# davvero, SENZA toccare Dixon-Coles/EWMA/time decay/shrinkage — è uno
+# strato in più sopra, non una modifica al motore.
+# =====================================================================
+def _path_calibratore(id_fd):
+    return f"calibratore_{id_fd}.pkl"
+
+
+def calcola_osservazioni_calibrazione(dati, calibratore=None):
+    """Ricalcola (prob_prevista_0_1, avverata_bool) su tutto lo storico —
+    stessa logica della curva di calibrazione, riusata anche per allenare
+    il correttore, così i due sono sempre coerenti tra loro.
+    Se calibratore è passato, le probabilità restituite sono quelle GIÀ
+    corrette (utile per mostrare la curva "dopo" senza duplicare codice)."""
+    tutte = dati[dati['FTHG'].notna()].reset_index(drop=True)
+    osservazioni = []
+    for i in range(15, len(tutte)):
+        partita = tutte.iloc[i]
+        prec = tutte.iloc[:i]
+        m = calcola_modello(prec, partita['HomeTeam'], partita['AwayTeam'],
+                             st.session_state.rho, data_riferimento=partita.get('Date_parsed'))
+        if m is None: continue
+        if calibratore is not None:
+            m = applica_calibrazione(m, calibratore)
+        esito = '1' if partita['FTHG']>partita['FTAG'] else ('2' if partita['FTHG']<partita['FTAG'] else 'X')
+        osservazioni.append((m['prob_1']/100, esito == '1'))
+        osservazioni.append((m['prob_X']/100, esito == 'X'))
+        osservazioni.append((m['prob_2']/100, esito == '2'))
+    return osservazioni
+
+
+def allena_calibratore(id_fd, osservazioni):
+    if len(osservazioni) < 100:
+        return None
+    x = np.array([p for p, _ in osservazioni])
+    y = np.array([1.0 if av else 0.0 for _, av in osservazioni])
+    calibratore = IsotonicRegression(out_of_bounds='clip', y_min=0.001, y_max=0.999)
+    calibratore.fit(x, y)
+    try:
+        with open(_path_calibratore(id_fd), "wb") as f:
+            pickle.dump({"calibratore": calibratore, "n_osservazioni": len(osservazioni),
+                         "timestamp": datetime.now().isoformat(timespec="minutes")}, f)
+    except Exception:
+        pass
+    return calibratore
+
+
+def carica_calibratore(id_fd):
+    path = _path_calibratore(id_fd)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def applica_calibrazione(modello, calibratore):
+    """Corregge prob_1/prob_X/prob_2 col calibratore e rinormalizza a 100
+    (la correzione isotonica indipendente per classe può non sommare a 100)."""
+    if calibratore is None or modello is None:
+        return modello
+    p1 = float(calibratore.predict([modello['prob_1']/100])[0])
+    px = float(calibratore.predict([modello['prob_X']/100])[0])
+    p2 = float(calibratore.predict([modello['prob_2']/100])[0])
+    tot = p1 + px + p2
+    if tot <= 0:
+        return modello
+    modello_corretto = dict(modello)
+    modello_corretto['prob_1'] = p1 / tot * 100
+    modello_corretto['prob_X'] = px / tot * 100
+    modello_corretto['prob_2'] = p2 / tot * 100
+    return modello_corretto
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def carica_dati_campionato(id_fd):
     """Ritorna (dati, errori, fresco, timestamp_ultimo_successo)."""
@@ -506,6 +590,14 @@ with st.sidebar:
         carica_dati_campionato.clear()
         st.success("Cache svuotata: al prossimo caricamento i dati saranno quelli attuali.")
 
+    st.divider()
+    usa_calibrazione = st.checkbox(
+        "🎯 Applica calibrazione post-hoc (se allenata per questo campionato)",
+        value=True,
+        help="Corregge le probabilità del modello sulla base della curva di calibrazione "
+             "misurata. Disattiva per confrontare 'prima/dopo' senza toccare il codice."
+    )
+
 campionato = st.selectbox("Torneo", list(CAMPIONATI.keys()))
 info_campionato = CAMPIONATI[campionato]
 solo_previsione = info_campionato.get("solo_previsione", False)
@@ -609,10 +701,19 @@ with tab_analisi:
             modello = calcola_modello(giocate, partita['HomeTeam'], partita['AwayTeam'],
                                        st.session_state.rho, data_riferimento=data_rif)
 
+            calib_info = carica_calibratore(id_fd) if usa_calibrazione else None
+            if modello is not None and calib_info is not None:
+                modello = applica_calibrazione(modello, calib_info["calibratore"])
+
             if modello is None:
                 st.warning("Pochi dati storici per un'analisi accurata.")
             else:
                 st.subheader(f"{partita['HomeTeam']} vs {partita['AwayTeam']}")
+                if calib_info is not None:
+                    st.caption(f"🎯 Probabilità 1X2 corrette con calibrazione post-hoc "
+                               f"(allenata su {calib_info['n_osservazioni']} osservazioni, {calib_info['timestamp']}). "
+                               f"Risultato esatto, Over/Under e Gol/No Gol restano quelli grezzi del modello — "
+                               f"la calibrazione è stata misurata e corretta solo sul mercato 1X2.")
                 if pd.notna(partita.get('FTHG')):
                     st.success(f"Risultato reale: {int(partita['FTHG'])} - {int(partita['FTAG'])}")
 
@@ -789,6 +890,8 @@ with tab_backtest:
             else:
                 n_bet, n_win = 0, 0
                 somma_clv, n_clv_pos, n_clv = 0.0, 0, 0
+                calib_info = carica_calibratore(id_fd) if usa_calibrazione else None
+                calibratore_attivo = calib_info["calibratore"] if calib_info else None
 
                 for i in indici:
                     partita = tutte.iloc[i]
@@ -796,6 +899,8 @@ with tab_backtest:
                     m = calcola_modello(prec, partita['HomeTeam'], partita['AwayTeam'],
                                          st.session_state.rho, data_riferimento=partita.get('Date_parsed'))
                     if m is None: continue
+                    if calibratore_attivo is not None:
+                        m = applica_calibrazione(m, calibratore_attivo)
                     quote = quote_mercato_normalizzate(partita, qh, qd, qa)
                     if quote is None: continue
                     quote_ch = quote_mercato_normalizzate(partita, ch_h, ch_d, ch_a) if clv_disp else None
@@ -863,12 +968,16 @@ with tab_backtest:
             if not indici:
                 st.warning("⚠️ Nessuna partita di stagione corrente disponibile per il confronto.")
             else:
+                calib_info_cs = carica_calibratore(id_fd) if usa_calibrazione else None
+                calibratore_attivo_cs = calib_info_cs["calibratore"] if calib_info_cs else None
                 for i in indici:
                     partita = tutte.iloc[i]
                     prec = tutte.iloc[:i]
                     m = calcola_modello(prec, partita['HomeTeam'], partita['AwayTeam'],
                                          st.session_state.rho, data_riferimento=partita.get('Date_parsed'))
                     if m is None: continue
+                    if calibratore_attivo_cs is not None:
+                        m = applica_calibrazione(m, calibratore_attivo_cs)
                     quote = quote_mercato_normalizzate(partita, qh, qd, qa)
                     if quote is None: continue
                     quote_ch = quote_mercato_normalizzate(partita, ch_h, ch_d, ch_a) if clv_disp else None
@@ -958,35 +1067,49 @@ with tab_backtest:
             st.rerun()
 
     # =====================================================================
-    # 🔧 FIX APP #8 — CURVA DI CALIBRAZIONE
-    # Non modifica il modello, lo misura: quando il modello dice "60% di
-    # probabilità" per un esito, quell'esito si verifica davvero circa il 60%
-    # delle volte? Raggruppiamo tutte le previsioni storiche in fasce (0-10%,
-    # 10-20%, ...) e confrontiamo la probabilità media prevista in ogni fascia
-    # con la frequenza reale con cui l'esito si è verificato. Se il modello è
-    # ben calibrato, i due valori dovrebbero coincidere quasi ovunque.
+    # 🔧 FIX APP #8/#9 — CURVA DI CALIBRAZIONE + CALIBRAZIONE POST-HOC
+    # La curva misura: quando il modello dice "60% di probabilità" per un
+    # esito, quell'esito si verifica davvero circa il 60% delle volte?
+    # Se no, "Allena calibrazione" costruisce un correttore (isotonic
+    # regression) specifico per questo campionato. L'interruttore nella
+    # barra laterale applica/rimuove la correzione OVUNQUE nell'app — così
+    # puoi confrontare "prima/dopo" senza mai toccare il codice.
     # =====================================================================
     st.divider()
-    st.write("**📐 Curva di calibrazione**")
-    st.caption("Verifica se le probabilità del modello sono oneste: quando dice 60%, "
-               "quell'esito si verifica davvero il 60% delle volte? Usa tutto lo storico "
-               "disponibile (non solo la stagione corrente) per un campione più solido.")
+    st.write("**📐 Curva di calibrazione & 🎯 correzione post-hoc**")
+    st.caption("La curva verifica se le probabilità del modello sono oneste. Se emerge un problema "
+               "sistematico, 'Allena calibrazione' costruisce un correttore per questo campionato "
+               "(non tocca Dixon-Coles/EWMA/shrinkage — è uno strato in più sopra). Usa tutto lo "
+               "storico disponibile per un campione più solido.")
 
-    if st.button("📐 Verifica calibrazione"):
+    calib_salvato = carica_calibratore(id_fd)
+    if calib_salvato:
+        stato_toggle = "ATTIVA ✅" if usa_calibrazione else "disattivata dall'interruttore in barra laterale ⏸️"
+        st.info(f"🎯 Calibrazione allenata il {calib_salvato['timestamp']} su "
+                f"{calib_salvato['n_osservazioni']} osservazioni — {stato_toggle}.")
+    else:
+        st.caption("Nessuna calibrazione ancora allenata per questo campionato.")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        cliccato_verifica = st.button("📐 Verifica calibrazione")
+    with col_b:
+        cliccato_allena = st.button("🎯 Allena calibrazione per questo campionato")
+
+    if cliccato_allena:
+        with st.spinner("Allenamento in corso su tutto lo storico disponibile..."):
+            osservazioni_raw = calcola_osservazioni_calibrazione(dati)  # SEMPRE grezze: alleniamo sul modello puro
+            calibratore_nuovo = allena_calibratore(id_fd, osservazioni_raw)
+        if calibratore_nuovo is None:
+            st.warning("Campione ancora troppo piccolo (serve almeno 100 osservazioni) per allenare la calibrazione.")
+        else:
+            st.success(f"✅ Calibrazione allenata e salvata su {len(osservazioni_raw)} osservazioni. "
+                       f"Ricontrolla la curva qui sotto per vedere l'effetto.")
+
+    if cliccato_verifica:
         with st.spinner("Calcolo in corso su tutto lo storico disponibile..."):
-            tutte = dati[dati['FTHG'].notna()].reset_index(drop=True)
-            osservazioni = []  # (prob_prevista_0_1, avverata_bool)
-
-            for i in range(15, len(tutte)):
-                partita = tutte.iloc[i]
-                prec = tutte.iloc[:i]
-                m = calcola_modello(prec, partita['HomeTeam'], partita['AwayTeam'],
-                                     st.session_state.rho, data_riferimento=partita.get('Date_parsed'))
-                if m is None: continue
-                esito = '1' if partita['FTHG']>partita['FTAG'] else ('2' if partita['FTHG']<partita['FTAG'] else 'X')
-                osservazioni.append((m['prob_1']/100, esito == '1'))
-                osservazioni.append((m['prob_X']/100, esito == 'X'))
-                osservazioni.append((m['prob_2']/100, esito == '2'))
+            calib_attivo_curva = calib_salvato["calibratore"] if (calib_salvato and usa_calibrazione) else None
+            osservazioni = calcola_osservazioni_calibrazione(dati, calibratore=calib_attivo_curva)
 
             if len(osservazioni) < 100:
                 st.warning("Campione ancora troppo piccolo per una curva di calibrazione affidabile.")
@@ -1013,6 +1136,7 @@ with tab_backtest:
                     })
                     dati_grafico.append({"Prevista": prob_media_prevista, "Reale": freq_reale})
 
+                st.write("**Calibrata** 🎯" if calib_attivo_curva is not None else "**Grezza (senza correzione)**")
                 st.table(pd.DataFrame(righe_calib))
 
                 if dati_grafico:
@@ -1021,4 +1145,5 @@ with tab_backtest:
                     st.caption("Le due linee dovrebbero sovrapporsi quasi ovunque se il modello è ben "
                                "calibrato. Se 'Reale' è sistematicamente sotto 'Prevista', il modello è "
                                "troppo sicuro di sé (overconfident) — un problema serio se poi usi lo "
-                               "score per decidere quanto fidarti di una previsione.")
+                               "score per decidere quanto fidarti di una previsione. Usa l'interruttore "
+                               "'Applica calibrazione' in barra laterale per confrontare prima/dopo.")
