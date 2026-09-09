@@ -956,3 +956,69 @@ with tab_backtest:
             salva_storico_soglie(storico_rimasto)
             st.success("Storico cancellato per questo campionato.")
             st.rerun()
+
+    # =====================================================================
+    # 🔧 FIX APP #8 — CURVA DI CALIBRAZIONE
+    # Non modifica il modello, lo misura: quando il modello dice "60% di
+    # probabilità" per un esito, quell'esito si verifica davvero circa il 60%
+    # delle volte? Raggruppiamo tutte le previsioni storiche in fasce (0-10%,
+    # 10-20%, ...) e confrontiamo la probabilità media prevista in ogni fascia
+    # con la frequenza reale con cui l'esito si è verificato. Se il modello è
+    # ben calibrato, i due valori dovrebbero coincidere quasi ovunque.
+    # =====================================================================
+    st.divider()
+    st.write("**📐 Curva di calibrazione**")
+    st.caption("Verifica se le probabilità del modello sono oneste: quando dice 60%, "
+               "quell'esito si verifica davvero il 60% delle volte? Usa tutto lo storico "
+               "disponibile (non solo la stagione corrente) per un campione più solido.")
+
+    if st.button("📐 Verifica calibrazione"):
+        with st.spinner("Calcolo in corso su tutto lo storico disponibile..."):
+            tutte = dati[dati['FTHG'].notna()].reset_index(drop=True)
+            osservazioni = []  # (prob_prevista_0_1, avverata_bool)
+
+            for i in range(15, len(tutte)):
+                partita = tutte.iloc[i]
+                prec = tutte.iloc[:i]
+                m = calcola_modello(prec, partita['HomeTeam'], partita['AwayTeam'],
+                                     st.session_state.rho, data_riferimento=partita.get('Date_parsed'))
+                if m is None: continue
+                esito = '1' if partita['FTHG']>partita['FTAG'] else ('2' if partita['FTHG']<partita['FTAG'] else 'X')
+                osservazioni.append((m['prob_1']/100, esito == '1'))
+                osservazioni.append((m['prob_X']/100, esito == 'X'))
+                osservazioni.append((m['prob_2']/100, esito == '2'))
+
+            if len(osservazioni) < 100:
+                st.warning("Campione ancora troppo piccolo per una curva di calibrazione affidabile.")
+            else:
+                fasce = [(i/10, (i+1)/10) for i in range(10)]
+                righe_calib = []
+                dati_grafico = []
+                for lo, hi in fasce:
+                    in_fascia = [av for p, av in osservazioni if lo <= p < hi] if hi < 1.0 else \
+                                [av for p, av in osservazioni if lo <= p <= hi]
+                    probs_fascia = [p for p, av in osservazioni if lo <= p < hi] if hi < 1.0 else \
+                                   [p for p, av in osservazioni if lo <= p <= hi]
+                    n = len(in_fascia)
+                    if n == 0:
+                        continue
+                    prob_media_prevista = sum(probs_fascia) / n * 100
+                    freq_reale = sum(in_fascia) / n * 100
+                    righe_calib.append({
+                        "Fascia": f"{int(lo*100)}-{int(hi*100)}%",
+                        "N. previsioni": n,
+                        "Probabilità media prevista": f"{prob_media_prevista:.1f}%",
+                        "Frequenza reale verificata": f"{freq_reale:.1f}%",
+                        "Scarto": f"{freq_reale - prob_media_prevista:+.1f}%",
+                    })
+                    dati_grafico.append({"Prevista": prob_media_prevista, "Reale": freq_reale})
+
+                st.table(pd.DataFrame(righe_calib))
+
+                if dati_grafico:
+                    df_grafico = pd.DataFrame(dati_grafico, index=[r["Fascia"] for r in righe_calib])
+                    st.line_chart(df_grafico)
+                    st.caption("Le due linee dovrebbero sovrapporsi quasi ovunque se il modello è ben "
+                               "calibrato. Se 'Reale' è sistematicamente sotto 'Prevista', il modello è "
+                               "troppo sicuro di sé (overconfident) — un problema serio se poi usi lo "
+                               "score per decidere quanto fidarti di una previsione.")
