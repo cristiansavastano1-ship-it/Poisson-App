@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -237,23 +236,38 @@ def valuta_affidabilita(quota_book_norm, quota_macchina, n_storico):
 # di un browser). Qui simuliamo un browser vero e riproviamo un paio di
 # volte prima di arrenderci, riportando l'errore reale invece di un generico
 # "impossibile scaricare i dati".
+#
+# FIX APP #7 — variante senza "www". Il gestore del sito (Joseph Buchdahl,
+# @12Xpert su X) ha confermato pubblicamente che chi accede da fuori UK può
+# avere problemi con "www.football-data.co.uk" e consiglia di togliere il
+# "www". Proviamo prima la variante senza www (probabile causa dei nostri
+# blocchi, dato che i server di hosting non sono nel Regno Unito), poi quella
+# con www come riserva, a ogni tentativo.
 HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
-    """Scarica un CSV con header da browser e qualche tentativo prima di
-    arrendersi. Ritorna (dataframe, errore) — errore è None se riuscito."""
+    """Scarica un CSV con header da browser, provando sia la variante senza
+    www sia quella con www, con qualche tentativo prima di arrendersi.
+    Ritorna (dataframe, errore) — errore è None se riuscito."""
+    varianti_url = [url]
+    if "://www." in url:
+        varianti_url.append(url.replace("://www.", "://"))
+    elif "://" in url:
+        varianti_url.append(url.replace("://", "://www."))
+
     ultimo_errore = None
     for tentativo in range(tentativi):
-        try:
-            resp = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
-            resp.raise_for_status()
-            df = pd.read_csv(io.StringIO(resp.text))
-            return df, None
-        except Exception as e:
-            ultimo_errore = str(e)
-            if tentativo < tentativi - 1:
-                time.sleep(attesa_secondi)
+        for url_prova in varianti_url:
+            try:
+                resp = requests.get(url_prova, headers=HEADERS_BROWSER, timeout=15)
+                resp.raise_for_status()
+                df = pd.read_csv(io.StringIO(resp.text))
+                return df, None
+            except Exception as e:
+                ultimo_errore = str(e)
+        if tentativo < tentativi - 1:
+            time.sleep(attesa_secondi)
     return None, ultimo_errore
 
 
@@ -296,7 +310,7 @@ def carica_dati_campionato(id_fd):
     frames = []
     errori = []
     for codice, label in [(codice_precedente, 'precedente'), (codice_corrente, 'corrente')]:
-        url = f"https://www.football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
+        url = f"https://football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
         df, errore = scarica_csv_robusto(url)
         if df is not None:
             df.columns = df.columns.str.strip()
@@ -324,7 +338,7 @@ def carica_dati_campionato(id_fd):
 def carica_fixture_future(id_fd):
     """Ritorna (fixture_df, errore, fresco, timestamp_ultimo_successo)."""
     path = _path_cache("cache_fixture", id_fd)
-    df, errore = scarica_csv_robusto("https://www.football-data.co.uk/fixtures.csv")
+    df, errore = scarica_csv_robusto("https://football-data.co.uk/fixtures.csv")
 
     if df is not None:
         fx = df.copy()
