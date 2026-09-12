@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -251,7 +250,15 @@ HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
 def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
     """Scarica un CSV con header da browser, provando sia la variante senza
     www sia quella con www, con qualche tentativo prima di arrendersi.
-    Ritorna (dataframe, errore) — errore è None se riuscito."""
+    Ritorna (dataframe, errore) — errore è None se riuscito.
+
+    FIX APP #11 — BOM (Byte Order Mark): fixtures.csv inizia con un carattere
+    invisibile Unicode che, se non gestito, si attacca al nome della prima
+    colonna ("Div" diventa qualcosa come "\\ufeffDiv"), facendo fallire in
+    silenzio ogni controllo tipo "if 'Div' in colonne" — l'app non trovava
+    MAI le fixture future, su nessun campionato, per questo motivo esatto.
+    'utf-8-sig' lo rimuove in fase di decodifica; non fa danno se il file
+    non ha il BOM (caso normale per i file storici mmz4281)."""
     varianti_url = [url]
     if "://www." in url:
         varianti_url.append(url.replace("://www.", "://"))
@@ -264,7 +271,9 @@ def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
             try:
                 resp = requests.get(url_prova, headers=HEADERS_BROWSER, timeout=15)
                 resp.raise_for_status()
-                df = pd.read_csv(io.StringIO(resp.text))
+                testo = resp.content.decode('utf-8-sig', errors='replace')
+                df = pd.read_csv(io.StringIO(testo))
+                df.columns = [str(c).replace('\ufeff', '').strip() for c in df.columns]  # rete di sicurezza extra
                 return df, None
             except Exception as e:
                 ultimo_errore = str(e)
